@@ -557,10 +557,13 @@ func TestContexts(t *testing.T) {
 		// {"contains(steps.*.outputs.name, 'value')", true, "steps-context-array-outputs"},
 		{"runner.os", "Linux", "runner-context"},
 		{"secrets.name", "value", "secrets-context"},
+		{"vars.name", "value", "vars-context"},
 		{"strategy.fail-fast", true, "strategy-context"},
 		{"matrix.os", "Linux", "matrix-context"},
 		{"needs.job-id.outputs.output-name", "value", "needs-context"},
 		{"needs.job-id.result", "success", "needs-context"},
+		{"contains(needs.*.result, 'success')", true, "needs-wildcard-context-contains-success"},
+		{"contains(needs.*.result, 'failure')", false, "needs-wildcard-context-contains-failure"},
 		{"inputs.name", "value", "inputs-context"},
 	}
 
@@ -593,6 +596,9 @@ func TestContexts(t *testing.T) {
 		Secrets: map[string]string{
 			"name": "value",
 		},
+		Vars: map[string]string{
+			"name": "value",
+		},
 		Strategy: map[string]interface{}{
 			"fail-fast": true,
 		},
@@ -601,6 +607,12 @@ func TestContexts(t *testing.T) {
 		},
 		Needs: map[string]Needs{
 			"job-id": {
+				Outputs: map[string]string{
+					"output-name": "value",
+				},
+				Result: "success",
+			},
+			"another-job-id": {
 				Outputs: map[string]string{
 					"output-name": "value",
 				},
