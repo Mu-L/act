@@ -2,7 +2,10 @@ package common
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // Warning that implements `error` but safe to ignore
@@ -50,7 +53,7 @@ func NewDebugExecutor(format string, args ...interface{}) Executor {
 // NewPipelineExecutor creates a new executor from a series of other executors
 func NewPipelineExecutor(executors ...Executor) Executor {
 	if len(executors) == 0 {
-		return func(ctx context.Context) error {
+		return func(_ context.Context) error {
 			return nil
 		}
 	}
@@ -83,7 +86,7 @@ func NewConditionalExecutor(conditional Conditional, trueExecutor Executor, fals
 
 // NewErrorExecutor creates a new executor that always errors out
 func NewErrorExecutor(err error) Executor {
-	return func(ctx context.Context) error {
+	return func(_ context.Context) error {
 		return err
 	}
 }
@@ -93,6 +96,11 @@ func NewParallelExecutor(parallel int, executors ...Executor) Executor {
 	return func(ctx context.Context) error {
 		work := make(chan Executor, len(executors))
 		errs := make(chan error, len(executors))
+
+		if 1 > parallel {
+			log.Debugf("Parallel tasks (%d) below minimum, setting to 1", parallel)
+			parallel = 1
+		}
 
 		for i := 0; i < parallel; i++ {
 			go func(work <-chan Executor, errs chan<- error) {
@@ -123,6 +131,31 @@ func NewParallelExecutor(parallel int, executors ...Executor) Executor {
 	}
 }
 
+func NewFieldExecutor(name string, value interface{}, exec Executor) Executor {
+	return func(ctx context.Context) error {
+		return exec(WithLogger(ctx, Logger(ctx).WithField(name, value)))
+	}
+}
+
+// Then runs another executor if this executor succeeds
+func (e Executor) ThenError(then func(ctx context.Context, err error) error) Executor {
+	return func(ctx context.Context) error {
+		err := e(ctx)
+		if err != nil {
+			switch err.(type) {
+			case Warning:
+				Logger(ctx).Warning(err.Error())
+			default:
+				return then(ctx, err)
+			}
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return then(ctx, err)
+	}
+}
+
 // Then runs another executor if this executor succeeds
 func (e Executor) Then(then Executor) Executor {
 	return func(ctx context.Context) error {
@@ -139,6 +172,25 @@ func (e Executor) Then(then Executor) Executor {
 			return ctx.Err()
 		}
 		return then(ctx)
+	}
+}
+
+// Then runs another executor if this executor succeeds
+func (e Executor) OnError(then Executor) Executor {
+	return func(ctx context.Context) error {
+		err := e(ctx)
+		if err != nil {
+			switch err.(type) {
+			case Warning:
+				Logger(ctx).Warning(err.Error())
+			default:
+				return errors.Join(err, then(ctx))
+			}
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
 	}
 }
 
@@ -164,7 +216,7 @@ func (e Executor) IfNot(conditional Conditional) Executor {
 
 // IfBool only runs this executor if conditional is true
 func (e Executor) IfBool(conditional bool) Executor {
-	return e.If(func(ctx context.Context) bool {
+	return e.If(func(_ context.Context) bool {
 		return conditional
 	})
 }

@@ -79,7 +79,7 @@ func (fwfs readWriteFSImpl) OpenAppendable(name string) (WritableFile, error) {
 		return nil, err
 	}
 
-	_, err = file.Seek(0, os.SEEK_END)
+	_, err = file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +160,7 @@ func uploads(router *httprouter.Router, baseDir string, fsys WriteFS) {
 		}
 	})
 
-	router.PATCH("/_apis/pipelines/workflows/:runId/artifacts", func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
+	router.PATCH("/_apis/pipelines/workflows/:runId/artifacts", func(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
 		json, err := json.Marshal(ResponseMessage{
 			Message: "success",
 		})
@@ -214,7 +214,7 @@ func downloads(router *httprouter.Router, baseDir string, fsys fs.FS) {
 		safePath := safeResolve(baseDir, filepath.Join(container, itemPath))
 
 		var files []ContainerItem
-		err := fs.WalkDir(fsys, safePath, func(path string, entry fs.DirEntry, err error) error {
+		err := fs.WalkDir(fsys, safePath, func(path string, entry fs.DirEntry, _ error) error {
 			if !entry.IsDir() {
 				rel, err := filepath.Rel(safePath, path)
 				if err != nil {
@@ -223,9 +223,13 @@ func downloads(router *httprouter.Router, baseDir string, fsys fs.FS) {
 
 				// if it was upload as gzip
 				rel = strings.TrimSuffix(rel, gzipExtension)
+				path := filepath.Join(itemPath, rel)
+
+				rel = filepath.ToSlash(rel)
+				path = filepath.ToSlash(path)
 
 				files = append(files, ContainerItem{
-					Path:            filepath.Join(itemPath, rel),
+					Path:            path,
 					ItemType:        "file",
 					ContentLocation: fmt.Sprintf("http://%s/artifact/%s/%s/%s", req.Host, container, itemPath, rel),
 				})
@@ -249,7 +253,7 @@ func downloads(router *httprouter.Router, baseDir string, fsys fs.FS) {
 		}
 	})
 
-	router.GET("/artifact/*path", func(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
+	router.GET("/artifact/*path", func(w http.ResponseWriter, _ *http.Request, params httprouter.Params) {
 		path := params.ByName("path")[1:]
 
 		safePath := safeResolve(baseDir, path)
@@ -285,6 +289,7 @@ func Serve(ctx context.Context, artifactPath string, addr string, port string) c
 	fsys := readWriteFSImpl{}
 	uploads(router, artifactPath, fsys)
 	downloads(router, artifactPath, fsys)
+	RoutesV4(router, artifactPath, fsys, fsys)
 
 	server := &http.Server{
 		Addr:              fmt.Sprintf("%s:%s", addr, port),
