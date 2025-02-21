@@ -1,4 +1,4 @@
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
 
 package container
 
@@ -16,27 +16,27 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/go-git/go-billy/v5/helper/polyfill"
-	"github.com/go-git/go-billy/v5/osfs"
-	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
-	"github.com/joho/godotenv"
-
-	"github.com/imdario/mergo"
-	"github.com/kballard/go-shellquote"
-	"github.com/spf13/pflag"
-
+	"dario.cat/mergo"
+	"github.com/Masterminds/semver"
 	"github.com/docker/cli/cli/connhelper"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/go-git/go-billy/v5/helper/polyfill"
+	"github.com/go-git/go-billy/v5/osfs"
+	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
+	"github.com/joho/godotenv"
+	"github.com/kballard/go-shellquote"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
-
-	"github.com/Masterminds/semver"
+	"github.com/spf13/pflag"
 	"golang.org/x/term"
 
 	"github.com/nektos/act/pkg/common"
+	"github.com/nektos/act/pkg/filecollector"
 )
 
 // NewContainer creates a reference to a container
@@ -66,7 +66,7 @@ func supportsContainerImagePlatform(ctx context.Context, cli client.APIClient) b
 
 func (cr *containerReference) Create(capAdd []string, capDrop []string) common.Executor {
 	return common.
-		NewInfoExecutor("%sdocker create image=%s platform=%s entrypoint=%+q cmd=%+q", logPrefix, cr.input.Image, cr.input.Platform, cr.input.Entrypoint, cr.input.Cmd).
+		NewInfoExecutor("%sdocker create image=%s platform=%s entrypoint=%+q cmd=%+q network=%+q", logPrefix, cr.input.Image, cr.input.Platform, cr.input.Entrypoint, cr.input.Cmd, cr.input.NetworkMode).
 		Then(
 			common.NewPipelineExecutor(
 				cr.connect(),
@@ -78,7 +78,7 @@ func (cr *containerReference) Create(capAdd []string, capDrop []string) common.E
 
 func (cr *containerReference) Start(attach bool) common.Executor {
 	return common.
-		NewInfoExecutor("%sdocker run image=%s platform=%s entrypoint=%+q cmd=%+q", logPrefix, cr.input.Image, cr.input.Platform, cr.input.Entrypoint, cr.input.Cmd).
+		NewInfoExecutor("%sdocker run image=%s platform=%s entrypoint=%+q cmd=%+q network=%+q", logPrefix, cr.input.Image, cr.input.Platform, cr.input.Entrypoint, cr.input.Cmd, cr.input.NetworkMode).
 		Then(
 			common.NewPipelineExecutor(
 				cr.connect(),
@@ -169,6 +169,30 @@ func (cr *containerReference) Remove() common.Executor {
 	).IfNot(common.Dryrun)
 }
 
+func (cr *containerReference) GetHealth(ctx context.Context) Health {
+	resp, err := cr.cli.ContainerInspect(ctx, cr.id)
+	logger := common.Logger(ctx)
+	if err != nil {
+		logger.Errorf("failed to query container health %s", err)
+		return HealthUnHealthy
+	}
+	if resp.Config == nil || resp.Config.Healthcheck == nil || resp.State == nil || resp.State.Health == nil || len(resp.Config.Healthcheck.Test) == 1 && strings.EqualFold(resp.Config.Healthcheck.Test[0], "NONE") {
+		logger.Debugf("no container health check defined")
+		return HealthHealthy
+	}
+
+	logger.Infof("container health of %s (%s) is %s", cr.id, resp.Config.Image, resp.State.Health.Status)
+	switch resp.State.Health.Status {
+	case "starting":
+		return HealthStarting
+	case "healthy":
+		return HealthHealthy
+	case "unhealthy":
+		return HealthUnHealthy
+	}
+	return HealthUnHealthy
+}
+
 func (cr *containerReference) ReplaceLogWriter(stdout io.Writer, stderr io.Writer) (io.Writer, io.Writer) {
 	out := cr.input.Stdout
 	err := cr.input.Stderr
@@ -213,7 +237,7 @@ func GetDockerClient(ctx context.Context) (cli client.APIClient, err error) {
 	return cli, nil
 }
 
-func GetHostInfo(ctx context.Context) (info types.Info, err error) {
+func GetHostInfo(ctx context.Context) (info system.Info, err error) {
 	var cli client.APIClient
 	cli, err = GetDockerClient(ctx)
 	if err != nil {
@@ -240,8 +264,10 @@ func RunnerArch(ctx context.Context) string {
 
 	archMapper := map[string]string{
 		"x86_64":  "X64",
-		"386":     "x86",
-		"aarch64": "arm64",
+		"amd64":   "X64",
+		"386":     "X86",
+		"aarch64": "ARM64",
+		"arm64":   "ARM64",
 	}
 	if arch, ok := archMapper[info.Architecture]; ok {
 		return arch
@@ -264,7 +290,7 @@ func (cr *containerReference) connect() common.Executor {
 }
 
 func (cr *containerReference) Close() common.Executor {
-	return func(ctx context.Context) error {
+	return func(_ context.Context) error {
 		if cr.cli != nil {
 			err := cr.cli.Close()
 			cr.cli = nil
@@ -281,7 +307,7 @@ func (cr *containerReference) find() common.Executor {
 		if cr.id != "" {
 			return nil
 		}
-		containers, err := cr.cli.ContainerList(ctx, types.ContainerListOptions{
+		containers, err := cr.cli.ContainerList(ctx, container.ListOptions{
 			All: true,
 		})
 		if err != nil {
@@ -309,7 +335,7 @@ func (cr *containerReference) remove() common.Executor {
 		}
 
 		logger := common.Logger(ctx)
-		err := cr.cli.ContainerRemove(ctx, cr.id, types.ContainerRemoveOptions{
+		err := cr.cli.ContainerRemove(ctx, cr.id, container.RemoveOptions{
 			RemoveVolumes: true,
 			Force:         true,
 		})
@@ -346,12 +372,12 @@ func (cr *containerReference) mergeContainerConfigs(ctx context.Context, config 
 	}
 
 	if len(copts.netMode.Value()) == 0 {
-		if err = copts.netMode.Set("host"); err != nil {
-			return nil, nil, fmt.Errorf("Cannot parse networkmode=host. This is an internal error and should not happen: '%w'", err)
+		if err = copts.netMode.Set(cr.input.NetworkMode); err != nil {
+			return nil, nil, fmt.Errorf("Cannot parse networkmode=%s. This is an internal error and should not happen: '%w'", cr.input.NetworkMode, err)
 		}
 	}
 
-	containerConfig, err := parse(flags, copts, "")
+	containerConfig, err := parse(flags, copts, runtime.GOOS)
 	if err != nil {
 		return nil, nil, fmt.Errorf("Cannot process container options: '%s': '%w'", input.Options, err)
 	}
@@ -391,10 +417,11 @@ func (cr *containerReference) create(capAdd []string, capDrop []string) common.E
 		input := cr.input
 
 		config := &container.Config{
-			Image:      input.Image,
-			WorkingDir: input.WorkingDir,
-			Env:        input.Env,
-			Tty:        isTerminal,
+			Image:        input.Image,
+			WorkingDir:   input.WorkingDir,
+			Env:          input.Env,
+			ExposedPorts: input.ExposedPorts,
+			Tty:          isTerminal,
 		}
 		logger.Debugf("Common container.Config ==> %+v", config)
 
@@ -430,13 +457,14 @@ func (cr *containerReference) create(capAdd []string, capDrop []string) common.E
 		}
 
 		hostConfig := &container.HostConfig{
-			CapAdd:      capAdd,
-			CapDrop:     capDrop,
-			Binds:       input.Binds,
-			Mounts:      mounts,
-			NetworkMode: container.NetworkMode(input.NetworkMode),
-			Privileged:  input.Privileged,
-			UsernsMode:  container.UsernsMode(input.UsernsMode),
+			CapAdd:       capAdd,
+			CapDrop:      capDrop,
+			Binds:        input.Binds,
+			Mounts:       mounts,
+			NetworkMode:  container.NetworkMode(input.NetworkMode),
+			Privileged:   input.Privileged,
+			UsernsMode:   container.UsernsMode(input.UsernsMode),
+			PortBindings: input.PortBindings,
 		}
 		logger.Debugf("Common container.HostConfig ==> %+v", hostConfig)
 
@@ -445,7 +473,22 @@ func (cr *containerReference) create(capAdd []string, capDrop []string) common.E
 			return err
 		}
 
-		resp, err := cr.cli.ContainerCreate(ctx, config, hostConfig, nil, platSpecs, input.Name)
+		var networkingConfig *network.NetworkingConfig
+		logger.Debugf("input.NetworkAliases ==> %v", input.NetworkAliases)
+		n := hostConfig.NetworkMode
+		// IsUserDefined and IsHost are broken on windows
+		if n.IsUserDefined() && n != "host" && len(input.NetworkAliases) > 0 {
+			endpointConfig := &network.EndpointSettings{
+				Aliases: input.NetworkAliases,
+			}
+			networkingConfig = &network.NetworkingConfig{
+				EndpointsConfig: map[string]*network.EndpointSettings{
+					input.NetworkMode: endpointConfig,
+				},
+			}
+		}
+
+		resp, err := cr.cli.ContainerCreate(ctx, config, hostConfig, networkingConfig, platSpecs, input.Name)
 		if err != nil {
 			return fmt.Errorf("failed to create container: '%w'", err)
 		}
@@ -466,11 +509,17 @@ func (cr *containerReference) extractFromImageEnv(env *map[string]string) common
 		inspect, _, err := cr.cli.ImageInspectWithRaw(ctx, cr.input.Image)
 		if err != nil {
 			logger.Error(err)
+			return fmt.Errorf("inspect image: %w", err)
+		}
+
+		if inspect.Config == nil {
+			return nil
 		}
 
 		imageEnv, err := godotenv.Unmarshal(strings.Join(inspect.Config.Env, "\n"))
 		if err != nil {
 			logger.Error(err)
+			return fmt.Errorf("unmarshal image env: %w", err)
 		}
 
 		for k, v := range imageEnv {
@@ -521,7 +570,7 @@ func (cr *containerReference) exec(cmd []string, env map[string]string, user, wo
 		}
 		logger.Debugf("Working directory '%s'", wd)
 
-		idResp, err := cr.cli.ContainerExecCreate(ctx, cr.id, types.ExecConfig{
+		idResp, err := cr.cli.ContainerExecCreate(ctx, cr.id, container.ExecOptions{
 			User:         user,
 			Cmd:          cmd,
 			WorkingDir:   wd,
@@ -534,7 +583,7 @@ func (cr *containerReference) exec(cmd []string, env map[string]string, user, wo
 			return fmt.Errorf("failed to create exec: %w", err)
 		}
 
-		resp, err := cr.cli.ContainerExecAttach(ctx, idResp.ID, types.ExecStartCheck{
+		resp, err := cr.cli.ContainerExecAttach(ctx, idResp.ID, container.ExecStartOptions{
 			Tty: isTerminal,
 		})
 		if err != nil {
@@ -565,7 +614,7 @@ func (cr *containerReference) exec(cmd []string, env map[string]string, user, wo
 
 func (cr *containerReference) tryReadID(opt string, cbk func(id int)) common.Executor {
 	return func(ctx context.Context) error {
-		idResp, err := cr.cli.ContainerExecCreate(ctx, cr.id, types.ExecConfig{
+		idResp, err := cr.cli.ContainerExecCreate(ctx, cr.id, container.ExecOptions{
 			Cmd:          []string{"id", opt},
 			AttachStdout: true,
 			AttachStderr: true,
@@ -574,7 +623,7 @@ func (cr *containerReference) tryReadID(opt string, cbk func(id int)) common.Exe
 			return nil
 		}
 
-		resp, err := cr.cli.ContainerExecAttach(ctx, idResp.ID, types.ExecStartCheck{})
+		resp, err := cr.cli.ContainerExecAttach(ctx, idResp.ID, container.ExecStartOptions{})
 		if err != nil {
 			return nil
 		}
@@ -604,7 +653,7 @@ func (cr *containerReference) tryReadGID() common.Executor {
 	return cr.tryReadID("-g", func(id int) { cr.GID = id })
 }
 
-func (cr *containerReference) waitForCommand(ctx context.Context, isTerminal bool, resp types.HijackedResponse, idResp types.IDResponse, user string, workdir string) error {
+func (cr *containerReference) waitForCommand(ctx context.Context, isTerminal bool, resp types.HijackedResponse, _ types.IDResponse, _ string, _ string) error {
 	logger := common.Logger(ctx)
 
 	cmdResponse := make(chan error)
@@ -649,6 +698,32 @@ func (cr *containerReference) waitForCommand(ctx context.Context, isTerminal boo
 	}
 }
 
+func (cr *containerReference) CopyTarStream(ctx context.Context, destPath string, tarStream io.Reader) error {
+	// Mkdir
+	buf := &bytes.Buffer{}
+	tw := tar.NewWriter(buf)
+	_ = tw.WriteHeader(&tar.Header{
+		Name:     destPath,
+		Mode:     0o777,
+		Typeflag: tar.TypeDir,
+	})
+	tw.Close()
+	err := cr.cli.CopyToContainer(ctx, cr.id, "/", buf, container.CopyToContainerOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to mkdir to copy content to container: %w", err)
+	}
+	// Copy Content
+	err = cr.cli.CopyToContainer(ctx, cr.id, destPath, tarStream, container.CopyToContainerOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to copy content to container: %w", err)
+	}
+	// If this fails, then folders have wrong permissions on non root container
+	if cr.UID != 0 || cr.GID != 0 {
+		_ = cr.Exec([]string{"chown", "-R", fmt.Sprintf("%d:%d", cr.UID, cr.GID), destPath}, nil, "0", "")(ctx)
+	}
+	return nil
+}
+
 func (cr *containerReference) copyDir(dstPath string, srcPath string, useGitIgnore bool) common.Executor {
 	return func(ctx context.Context) error {
 		logger := common.Logger(ctx)
@@ -686,12 +761,12 @@ func (cr *containerReference) copyDir(dstPath string, srcPath string, useGitIgno
 			ignorer = gitignore.NewMatcher(ps)
 		}
 
-		fc := &fileCollector{
-			Fs:        &defaultFs{},
+		fc := &filecollector.FileCollector{
+			Fs:        &filecollector.DefaultFs{},
 			Ignorer:   ignorer,
 			SrcPath:   srcPath,
 			SrcPrefix: srcPrefix,
-			Handler: &tarCollector{
+			Handler: &filecollector.TarCollector{
 				TarWriter: tw,
 				UID:       cr.UID,
 				GID:       cr.GID,
@@ -699,7 +774,7 @@ func (cr *containerReference) copyDir(dstPath string, srcPath string, useGitIgno
 			},
 		}
 
-		err = filepath.Walk(srcPath, fc.collectFiles(ctx, []string{}))
+		err = filepath.Walk(srcPath, fc.CollectFiles(ctx, []string{}))
 		if err != nil {
 			return err
 		}
@@ -712,7 +787,7 @@ func (cr *containerReference) copyDir(dstPath string, srcPath string, useGitIgno
 		if err != nil {
 			return fmt.Errorf("failed to seek tar archive: %w", err)
 		}
-		err = cr.cli.CopyToContainer(ctx, cr.id, "/", tarFile, types.CopyToContainerOptions{})
+		err = cr.cli.CopyToContainer(ctx, cr.id, "/", tarFile, container.CopyToContainerOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to copy content to container: %w", err)
 		}
@@ -729,7 +804,7 @@ func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) c
 			logger.Debugf("Writing entry to tarball %s len:%d", file.Name, len(file.Body))
 			hdr := &tar.Header{
 				Name: file.Name,
-				Mode: file.Mode,
+				Mode: int64(file.Mode),
 				Size: int64(len(file.Body)),
 				Uid:  cr.UID,
 				Gid:  cr.GID,
@@ -746,7 +821,7 @@ func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) c
 		}
 
 		logger.Debugf("Extracting content to '%s'", dstPath)
-		err := cr.cli.CopyToContainer(ctx, cr.id, dstPath, &buf, types.CopyToContainerOptions{})
+		err := cr.cli.CopyToContainer(ctx, cr.id, dstPath, &buf, container.CopyToContainerOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to copy content to container: %w", err)
 		}
@@ -756,7 +831,7 @@ func (cr *containerReference) copyContent(dstPath string, files ...*FileEntry) c
 
 func (cr *containerReference) attach() common.Executor {
 	return func(ctx context.Context) error {
-		out, err := cr.cli.ContainerAttach(ctx, cr.id, types.ContainerAttachOptions{
+		out, err := cr.cli.ContainerAttach(ctx, cr.id, container.AttachOptions{
 			Stream: true,
 			Stdout: true,
 			Stderr: true,
@@ -794,7 +869,7 @@ func (cr *containerReference) start() common.Executor {
 		logger := common.Logger(ctx)
 		logger.Debugf("Starting container: %v", cr.id)
 
-		if err := cr.cli.ContainerStart(ctx, cr.id, types.ContainerStartOptions{}); err != nil {
+		if err := cr.cli.ContainerStart(ctx, cr.id, container.StartOptions{}); err != nil {
 			return fmt.Errorf("failed to start container: %w", err)
 		}
 

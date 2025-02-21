@@ -1,4 +1,4 @@
-//go:build WITHOUT_DOCKER || !(linux || darwin || windows)
+//go:build WITHOUT_DOCKER || !(linux || darwin || windows || netbsd)
 
 package container
 
@@ -6,7 +6,7 @@ import (
 	"context"
 	"runtime"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/system"
 	"github.com/nektos/act/pkg/common"
 	"github.com/pkg/errors"
 )
@@ -46,11 +46,23 @@ func RunnerArch(ctx context.Context) string {
 	return runtime.GOOS
 }
 
-func GetHostInfo(ctx context.Context) (info types.Info, err error) {
-	return types.Info{}, nil
+func GetHostInfo(ctx context.Context) (info system.Info, err error) {
+	return system.Info{}, nil
 }
 
 func NewDockerVolumeRemoveExecutor(volume string, force bool) common.Executor {
+	return func(ctx context.Context) error {
+		return nil
+	}
+}
+
+func NewDockerNetworkCreateExecutor(name string) common.Executor {
+	return func(ctx context.Context) error {
+		return nil
+	}
+}
+
+func NewDockerNetworkRemoveExecutor(name string) common.Executor {
 	return func(ctx context.Context) error {
 		return nil
 	}
