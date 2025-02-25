@@ -28,6 +28,9 @@ func createRunContext(t *testing.T) *RunContext {
 			Secrets: map[string]string{
 				"CASE_INSENSITIVE_SECRET": "value",
 			},
+			Vars: map[string]string{
+				"CASE_INSENSITIVE_VAR": "value",
+			},
 		},
 		Env: map[string]string{
 			"key": "value",
@@ -122,6 +125,8 @@ func TestEvaluateRunContext(t *testing.T) {
 		{"env.key", "value", ""},
 		{"secrets.CASE_INSENSITIVE_SECRET", "value", ""},
 		{"secrets.case_insensitive_secret", "value", ""},
+		{"vars.CASE_INSENSITIVE_VAR", "value", ""},
+		{"vars.case_insensitive_var", "value", ""},
 		{"format('{{0}}', 'test')", "{0}", ""},
 		{"format('{{{0}}}', 'test')", "{test}", ""},
 		{"format('}}')", "}", ""},
@@ -133,7 +138,6 @@ func TestEvaluateRunContext(t *testing.T) {
 	}
 
 	for _, table := range tables {
-		table := table
 		t.Run(table.in, func(t *testing.T) {
 			assertObject := assert.New(t)
 			out, err := ee.evaluate(context.Background(), table.in, exprparser.DefaultStatusCheckNone)
@@ -173,7 +177,6 @@ func TestEvaluateStep(t *testing.T) {
 	}
 
 	for _, table := range tables {
-		table := table
 		t.Run(table.in, func(t *testing.T) {
 			assertObject := assert.New(t)
 			out, err := ee.evaluate(context.Background(), table.in, exprparser.DefaultStatusCheckNone)
@@ -194,6 +197,9 @@ func TestInterpolate(t *testing.T) {
 			Workdir: ".",
 			Secrets: map[string]string{
 				"CASE_INSENSITIVE_SECRET": "value",
+			},
+			Vars: map[string]string{
+				"CASE_INSENSITIVE_VAR": "value",
 			},
 		},
 		Env: map[string]string{
@@ -229,6 +235,8 @@ func TestInterpolate(t *testing.T) {
 		{" ${{ env.KEY_WITH_UNDERSCORES }} ", " value_with_underscores "},
 		{"${{ secrets.CASE_INSENSITIVE_SECRET }}", "value"},
 		{"${{ secrets.case_insensitive_secret }}", "value"},
+		{"${{ vars.CASE_INSENSITIVE_VAR }}", "value"},
+		{"${{ vars.case_insensitive_var }}", "value"},
 		{"${{ env.UNKNOWN }}", ""},
 		{"${{ env.SOMETHING_TRUE }}", "true"},
 		{"${{ env.SOMETHING_FALSE }}", "false"},
@@ -252,7 +260,6 @@ func TestInterpolate(t *testing.T) {
 
 	updateTestExpressionWorkflow(t, tables, rc)
 	for _, table := range tables {
-		table := table
 		t.Run("interpolate", func(t *testing.T) {
 			assertObject := assert.New(t)
 			out := ee.Interpolate(context.Background(), table.in)

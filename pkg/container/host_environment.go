@@ -21,6 +21,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/nektos/act/pkg/common"
+	"github.com/nektos/act/pkg/filecollector"
 	"github.com/nektos/act/pkg/lookpath"
 )
 
@@ -34,20 +35,20 @@ type HostEnvironment struct {
 	StdOut    io.Writer
 }
 
-func (e *HostEnvironment) Create(capAdd []string, capDrop []string) common.Executor {
-	return func(ctx context.Context) error {
+func (e *HostEnvironment) Create(_ []string, _ []string) common.Executor {
+	return func(_ context.Context) error {
 		return nil
 	}
 }
 
 func (e *HostEnvironment) Close() common.Executor {
-	return func(ctx context.Context) error {
+	return func(_ context.Context) error {
 		return nil
 	}
 }
 
 func (e *HostEnvironment) Copy(destPath string, files ...*FileEntry) common.Executor {
-	return func(ctx context.Context) error {
+	return func(_ context.Context) error {
 		for _, f := range files {
 			if err := os.MkdirAll(filepath.Dir(filepath.Join(destPath, f.Name)), 0o777); err != nil {
 				return err
@@ -57,6 +58,33 @@ func (e *HostEnvironment) Copy(destPath string, files ...*FileEntry) common.Exec
 			}
 		}
 		return nil
+	}
+}
+
+func (e *HostEnvironment) CopyTarStream(ctx context.Context, destPath string, tarStream io.Reader) error {
+	if err := os.RemoveAll(destPath); err != nil {
+		return err
+	}
+	tr := tar.NewReader(tarStream)
+	cp := &filecollector.CopyCollector{
+		DstDir: destPath,
+	}
+	for {
+		ti, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		if ti.FileInfo().IsDir() {
+			continue
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("CopyTarStream has been cancelled")
+		}
+		if err := cp.WriteFile(ti.Name, ti.FileInfo(), ti.Linkname, tr); err != nil {
+			return err
+		}
 	}
 }
 
@@ -77,16 +105,16 @@ func (e *HostEnvironment) CopyDir(destPath string, srcPath string, useGitIgnore 
 
 			ignorer = gitignore.NewMatcher(ps)
 		}
-		fc := &fileCollector{
-			Fs:        &defaultFs{},
+		fc := &filecollector.FileCollector{
+			Fs:        &filecollector.DefaultFs{},
 			Ignorer:   ignorer,
 			SrcPath:   srcPath,
 			SrcPrefix: srcPrefix,
-			Handler: &copyCollector{
+			Handler: &filecollector.CopyCollector{
 				DstDir: destPath,
 			},
 		}
-		return filepath.Walk(srcPath, fc.collectFiles(ctx, []string{}))
+		return filepath.Walk(srcPath, fc.CollectFiles(ctx, []string{}))
 	}
 }
 
@@ -99,21 +127,21 @@ func (e *HostEnvironment) GetContainerArchive(ctx context.Context, srcPath strin
 	if err != nil {
 		return nil, err
 	}
-	tc := &tarCollector{
+	tc := &filecollector.TarCollector{
 		TarWriter: tw,
 	}
 	if fi.IsDir() {
-		srcPrefix := filepath.Dir(srcPath)
+		srcPrefix := srcPath
 		if !strings.HasSuffix(srcPrefix, string(filepath.Separator)) {
 			srcPrefix += string(filepath.Separator)
 		}
-		fc := &fileCollector{
-			Fs:        &defaultFs{},
+		fc := &filecollector.FileCollector{
+			Fs:        &filecollector.DefaultFs{},
 			SrcPath:   srcPath,
 			SrcPrefix: srcPrefix,
 			Handler:   tc,
 		}
-		err = filepath.Walk(srcPath, fc.collectFiles(ctx, []string{}))
+		err = filepath.Walk(srcPath, fc.CollectFiles(ctx, []string{}))
 		if err != nil {
 			return nil, err
 		}
@@ -140,14 +168,14 @@ func (e *HostEnvironment) GetContainerArchive(ctx context.Context, srcPath strin
 	return io.NopCloser(buf), nil
 }
 
-func (e *HostEnvironment) Pull(forcePull bool) common.Executor {
-	return func(ctx context.Context) error {
+func (e *HostEnvironment) Pull(_ bool) common.Executor {
+	return func(_ context.Context) error {
 		return nil
 	}
 }
 
-func (e *HostEnvironment) Start(attach bool) common.Executor {
-	return func(ctx context.Context) error {
+func (e *HostEnvironment) Start(_ bool) common.Executor {
+	return func(_ context.Context) error {
 		return nil
 	}
 }
@@ -240,8 +268,8 @@ func copyPtyOutput(writer io.Writer, ppty io.Reader, finishLog context.CancelFun
 	}
 }
 
-func (e *HostEnvironment) UpdateFromImageEnv(env *map[string]string) common.Executor {
-	return func(ctx context.Context) error {
+func (e *HostEnvironment) UpdateFromImageEnv(_ *map[string]string) common.Executor {
+	return func(_ context.Context) error {
 		return nil
 	}
 }
@@ -254,7 +282,7 @@ func getEnvListFromMap(env map[string]string) []string {
 	return envList
 }
 
-func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline string, env map[string]string, user, workdir string) error {
+func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline string, env map[string]string, _, workdir string) error {
 	envList := getEnvListFromMap(env)
 	var wd string
 	if workdir != "" {
@@ -326,8 +354,12 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 }
 
 func (e *HostEnvironment) Exec(command []string /*cmdline string, */, env map[string]string, user, workdir string) common.Executor {
+	return e.ExecWithCmdLine(command, "", env, user, workdir)
+}
+
+func (e *HostEnvironment) ExecWithCmdLine(command []string, cmdline string, env map[string]string, user, workdir string) common.Executor {
 	return func(ctx context.Context) error {
-		if err := e.exec(ctx, command, "" /*cmdline*/, env, user, workdir); err != nil {
+		if err := e.exec(ctx, command, cmdline, env, user, workdir); err != nil {
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("this step has been cancelled: %w", err)
@@ -344,7 +376,7 @@ func (e *HostEnvironment) UpdateFromEnv(srcPath string, env *map[string]string) 
 }
 
 func (e *HostEnvironment) Remove() common.Executor {
-	return func(ctx context.Context) error {
+	return func(_ context.Context) error {
 		if e.CleanUp != nil {
 			e.CleanUp()
 		}
@@ -362,7 +394,11 @@ func (e *HostEnvironment) ToContainerPath(path string) string {
 }
 
 func (e *HostEnvironment) GetActPath() string {
-	return e.ActPath
+	actPath := e.ActPath
+	if runtime.GOOS == "windows" {
+		actPath = strings.ReplaceAll(actPath, "\\", "/")
+	}
+	return actPath
 }
 
 func (*HostEnvironment) GetPathVariableName() string {
@@ -383,11 +419,14 @@ func (*HostEnvironment) JoinPathVariable(paths ...string) string {
 	return strings.Join(paths, string(filepath.ListSeparator))
 }
 
+// Reference for Arch values for runner.arch
+// https://docs.github.com/en/actions/learn-github-actions/contexts#runner-context
 func goArchToActionArch(arch string) string {
 	archMapper := map[string]string{
+		"amd64":   "X64",
 		"x86_64":  "X64",
-		"386":     "x86",
-		"aarch64": "arm64",
+		"386":     "X86",
+		"aarch64": "ARM64",
 	}
 	if arch, ok := archMapper[arch]; ok {
 		return arch
@@ -397,7 +436,9 @@ func goArchToActionArch(arch string) string {
 
 func goOsToActionOs(os string) string {
 	osMapper := map[string]string{
-		"darwin": "macOS",
+		"linux":   "Linux",
+		"windows": "Windows",
+		"darwin":  "macOS",
 	}
 	if os, ok := osMapper[os]; ok {
 		return os
@@ -405,7 +446,7 @@ func goOsToActionOs(os string) string {
 	return os
 }
 
-func (e *HostEnvironment) GetRunnerContext(ctx context.Context) map[string]interface{} {
+func (e *HostEnvironment) GetRunnerContext(_ context.Context) map[string]interface{} {
 	return map[string]interface{}{
 		"os":         goOsToActionOs(runtime.GOOS),
 		"arch":       goArchToActionArch(runtime.GOARCH),
@@ -414,7 +455,11 @@ func (e *HostEnvironment) GetRunnerContext(ctx context.Context) map[string]inter
 	}
 }
 
-func (e *HostEnvironment) ReplaceLogWriter(stdout io.Writer, stderr io.Writer) (io.Writer, io.Writer) {
+func (e *HostEnvironment) GetHealth(_ context.Context) Health {
+	return HealthHealthy
+}
+
+func (e *HostEnvironment) ReplaceLogWriter(stdout io.Writer, _ io.Writer) (io.Writer, io.Writer) {
 	org := e.StdOut
 	e.StdOut = stdout
 	return org, org

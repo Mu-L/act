@@ -18,7 +18,7 @@ type stepDocker struct {
 }
 
 func (sd *stepDocker) pre() common.Executor {
-	return func(ctx context.Context) error {
+	return func(_ context.Context) error {
 		return nil
 	}
 }
@@ -30,7 +30,7 @@ func (sd *stepDocker) main() common.Executor {
 }
 
 func (sd *stepDocker) post() common.Executor {
-	return func(ctx context.Context) error {
+	return func(_ context.Context) error {
 		return nil
 	}
 }
@@ -51,7 +51,7 @@ func (sd *stepDocker) getEnv() *map[string]string {
 	return &sd.env
 }
 
-func (sd *stepDocker) getIfExpression(context context.Context, stage stepStage) string {
+func (sd *stepDocker) getIfExpression(_ context.Context, _ stepStage) string {
 	return sd.Step.If.Value
 }
 

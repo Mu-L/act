@@ -1,4 +1,4 @@
-//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows))
+//go:build !(WITHOUT_DOCKER || !(linux || darwin || windows || netbsd))
 
 package container
 
@@ -12,8 +12,9 @@ import (
 	"github.com/docker/docker/pkg/archive"
 
 	// github.com/docker/docker/builder/dockerignore is deprecated
-	"github.com/moby/buildkit/frontend/dockerfile/dockerignore"
+
 	"github.com/moby/patternmatcher"
+	"github.com/moby/patternmatcher/ignorefile"
 
 	"github.com/nektos/act/pkg/common"
 )
@@ -48,8 +49,8 @@ func NewDockerBuildExecutor(input NewDockerBuildExecutorInput) common.Executor {
 			Dockerfile:  input.Dockerfile,
 		}
 		var buildContext io.ReadCloser
-		if input.Container != nil {
-			buildContext, err = input.Container.GetContainerArchive(ctx, input.ContextDir+"/.")
+		if input.BuildContext != nil {
+			buildContext = io.NopCloser(input.BuildContext)
 		} else {
 			buildContext, err = createBuildContext(ctx, input.ContextDir, input.Dockerfile)
 		}
@@ -73,7 +74,7 @@ func createBuildContext(ctx context.Context, contextDir string, relDockerfile st
 	common.Logger(ctx).Debugf("Creating archive for build context dir '%s' with relative dockerfile '%s'", contextDir, relDockerfile)
 
 	// And canonicalize dockerfile name to a platform-independent one
-	relDockerfile = archive.CanonicalTarNameForPath(relDockerfile)
+	relDockerfile = filepath.ToSlash(relDockerfile)
 
 	f, err := os.Open(filepath.Join(contextDir, ".dockerignore"))
 	if err != nil && !os.IsNotExist(err) {
@@ -83,7 +84,7 @@ func createBuildContext(ctx context.Context, contextDir string, relDockerfile st
 
 	var excludes []string
 	if err == nil {
-		excludes, err = dockerignore.ReadAll(f)
+		excludes, err = ignorefile.ReadAll(f)
 		if err != nil {
 			return nil, err
 		}

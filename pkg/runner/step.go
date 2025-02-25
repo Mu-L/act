@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nektos/act/pkg/common"
 	"github.com/nektos/act/pkg/container"
@@ -31,6 +33,9 @@ const (
 	stepStageMain
 	stepStagePost
 )
+
+// Controls how many symlinks are resolved for local and remote Actions
+const maxSymlinkDepth = 10
 
 func (s stepStage) String() string {
 	switch s {
@@ -134,7 +139,9 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 			Mode: 0o666,
 		})(ctx)
 
-		err = executor(ctx)
+		timeoutctx, cancelTimeOut := evaluateStepTimeout(ctx, rc.ExprEval, stepModel)
+		defer cancelTimeOut()
+		err = executor(timeoutctx)
 
 		if err == nil {
 			logger.WithField("stepResult", stepResult.Outcome).Infof("  \u2705  Success - %s %s", stage, stepString)
@@ -182,6 +189,16 @@ func runStepExecutor(step step, stage stepStage, executor common.Executor) commo
 	}
 }
 
+func evaluateStepTimeout(ctx context.Context, exprEval ExpressionEvaluator, stepModel *model.Step) (context.Context, context.CancelFunc) {
+	timeout := exprEval.Interpolate(ctx, stepModel.TimeoutMinutes)
+	if timeout != "" {
+		if timeOutMinutes, err := strconv.ParseInt(timeout, 10, 64); err == nil {
+			return context.WithTimeout(ctx, time.Duration(timeOutMinutes)*time.Minute)
+		}
+	}
+	return ctx, func() {}
+}
+
 func setupEnv(ctx context.Context, step step) error {
 	rc := step.getRunContext()
 
@@ -222,6 +239,16 @@ func mergeEnv(ctx context.Context, step step) {
 	}
 
 	rc.withGithubEnv(ctx, step.getGithubContext(ctx), *env)
+
+	if step.getStepModel().Uses != "" {
+		// prevent uses action input pollution of unset parameters, skip this for run steps
+		// due to design flaw
+		for key := range *env {
+			if strings.Contains(key, "INPUT_") {
+				delete(*env, key)
+			}
+		}
+	}
 }
 
 func isStepEnabled(ctx context.Context, expr string, step step, stage stepStage) (bool, error) {
@@ -234,7 +261,7 @@ func isStepEnabled(ctx context.Context, expr string, step step, stage stepStage)
 		defaultStatusCheck = exprparser.DefaultStatusCheckSuccess
 	}
 
-	runStep, err := EvalBool(ctx, rc.NewStepExpressionEvaluator(ctx, step), expr, defaultStatusCheck)
+	runStep, err := EvalBool(ctx, rc.NewStepExpressionEvaluatorExt(ctx, step, stage == stepStageMain), expr, defaultStatusCheck)
 	if err != nil {
 		return false, fmt.Errorf("  \u274C  Error in if-expression: \"if: %s\" (%s)", expr, err)
 	}
@@ -242,7 +269,7 @@ func isStepEnabled(ctx context.Context, expr string, step step, stage stepStage)
 	return runStep, nil
 }
 
-func isContinueOnError(ctx context.Context, expr string, step step, stage stepStage) (bool, error) {
+func isContinueOnError(ctx context.Context, expr string, step step, _ stepStage) (bool, error) {
 	// https://github.com/github/docs/blob/3ae84420bd10997bb5f35f629ebb7160fe776eae/content/actions/reference/workflow-syntax-for-github-actions.md?plain=true#L962
 	if len(strings.TrimSpace(expr)) == 0 {
 		return false, nil
@@ -292,4 +319,14 @@ func mergeIntoMapCaseInsensitive(target map[string]string, maps ...map[string]st
 			target[toKey(k)] = v
 		}
 	}
+}
+
+func symlinkJoin(filename, sym, parent string) (string, error) {
+	dir := path.Dir(filename)
+	dest := path.Join(dir, sym)
+	prefix := path.Clean(parent) + "/"
+	if strings.HasPrefix(dest, prefix) || prefix == "./" {
+		return dest, nil
+	}
+	return "", fmt.Errorf("symlink tries to access file '%s' outside of '%s'", strings.ReplaceAll(dest, "'", "''"), strings.ReplaceAll(parent, "'", "''"))
 }

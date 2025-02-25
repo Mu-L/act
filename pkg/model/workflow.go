@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/nektos/act/pkg/common"
+	"github.com/nektos/act/pkg/schema"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -58,13 +60,24 @@ func (w *Workflow) On() []string {
 func (w *Workflow) OnEvent(event string) interface{} {
 	if w.RawOn.Kind == yaml.MappingNode {
 		var val map[string]interface{}
-		err := w.RawOn.Decode(&val)
-		if err != nil {
-			log.Fatal(err)
+		if !decodeNode(w.RawOn, &val) {
+			return nil
 		}
 		return val[event]
 	}
 	return nil
+}
+
+func (w *Workflow) UnmarshalYAML(node *yaml.Node) error {
+	// Validate the schema before deserializing it into our model
+	if err := (&schema.Node{
+		Definition: "workflow-root",
+		Schema:     schema.GetWorkflowSchema(),
+	}).UnmarshalYAML(node); err != nil {
+		return errors.Join(err, fmt.Errorf("Actions YAML Schema Validation Error detected:\nFor more information, see: https://nektosact.com/usage/schema.html"))
+	}
+	type WorkflowDefault Workflow
+	return node.Decode((*WorkflowDefault)(w))
 }
 
 type WorkflowDispatchInput struct {
@@ -80,31 +93,47 @@ type WorkflowDispatch struct {
 }
 
 func (w *Workflow) WorkflowDispatchConfig() *WorkflowDispatch {
-	if w.RawOn.Kind != yaml.MappingNode {
+	switch w.RawOn.Kind {
+	case yaml.ScalarNode:
+		var val string
+		if !decodeNode(w.RawOn, &val) {
+			return nil
+		}
+		if val == "workflow_dispatch" {
+			return &WorkflowDispatch{}
+		}
+	case yaml.SequenceNode:
+		var val []string
+		if !decodeNode(w.RawOn, &val) {
+			return nil
+		}
+		for _, v := range val {
+			if v == "workflow_dispatch" {
+				return &WorkflowDispatch{}
+			}
+		}
+	case yaml.MappingNode:
+		var val map[string]yaml.Node
+		if !decodeNode(w.RawOn, &val) {
+			return nil
+		}
+
+		n, found := val["workflow_dispatch"]
+		var workflowDispatch WorkflowDispatch
+		if found && decodeNode(n, &workflowDispatch) {
+			return &workflowDispatch
+		}
+	default:
 		return nil
 	}
-
-	var val map[string]yaml.Node
-	err := w.RawOn.Decode(&val)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var config WorkflowDispatch
-	node := val["workflow_dispatch"]
-	err = node.Decode(&config)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return &config
+	return nil
 }
 
 type WorkflowCallInput struct {
-	Description string `yaml:"description"`
-	Required    bool   `yaml:"required"`
-	Default     string `yaml:"default"`
-	Type        string `yaml:"type"`
+	Description string    `yaml:"description"`
+	Required    bool      `yaml:"required"`
+	Default     yaml.Node `yaml:"default"`
+	Type        string    `yaml:"type"`
 }
 
 type WorkflowCallOutput struct {
@@ -128,16 +157,14 @@ func (w *Workflow) WorkflowCallConfig() *WorkflowCall {
 	}
 
 	var val map[string]yaml.Node
-	err := w.RawOn.Decode(&val)
-	if err != nil {
-		log.Fatal(err)
+	if !decodeNode(w.RawOn, &val) {
+		return &WorkflowCall{}
 	}
 
 	var config WorkflowCall
 	node := val["workflow_call"]
-	err = node.Decode(&config)
-	if err != nil {
-		log.Fatal(err)
+	if !decodeNode(node, &config) {
+		return &WorkflowCall{}
 	}
 
 	return &config
@@ -220,9 +247,8 @@ func (j *Job) InheritSecrets() bool {
 	}
 
 	var val string
-	err := j.RawSecrets.Decode(&val)
-	if err != nil {
-		log.Fatal(err)
+	if !decodeNode(j.RawSecrets, &val) {
+		return false
 	}
 
 	return val == "inherit"
@@ -234,9 +260,8 @@ func (j *Job) Secrets() map[string]string {
 	}
 
 	var val map[string]string
-	err := j.RawSecrets.Decode(&val)
-	if err != nil {
-		log.Fatal(err)
+	if !decodeNode(j.RawSecrets, &val) {
+		return nil
 	}
 
 	return val
@@ -282,15 +307,39 @@ func (j *Job) Needs() []string {
 // RunsOn list for Job
 func (j *Job) RunsOn() []string {
 	switch j.RawRunsOn.Kind {
+	case yaml.MappingNode:
+		var val struct {
+			Group  string
+			Labels yaml.Node
+		}
+
+		if !decodeNode(j.RawRunsOn, &val) {
+			return nil
+		}
+
+		labels := nodeAsStringSlice(val.Labels)
+
+		if val.Group != "" {
+			labels = append(labels, val.Group)
+		}
+
+		return labels
+	default:
+		return nodeAsStringSlice(j.RawRunsOn)
+	}
+}
+
+func nodeAsStringSlice(node yaml.Node) []string {
+	switch node.Kind {
 	case yaml.ScalarNode:
 		var val string
-		if !decodeNode(j.RawRunsOn, &val) {
+		if !decodeNode(node, &val) {
 			return nil
 		}
 		return []string{val}
 	case yaml.SequenceNode:
 		var val []string
-		if !decodeNode(j.RawRunsOn, &val) {
+		if !decodeNode(node, &val) {
 			return nil
 		}
 		return val
@@ -308,7 +357,7 @@ func environment(yml yaml.Node) map[string]string {
 	return env
 }
 
-// Environments returns string-based key=value map for a job
+// Environment returns string-based key=value map for a job
 func (j *Job) Environment() map[string]string {
 	return environment(j.Env)
 }
@@ -424,6 +473,7 @@ func (j *Job) GetMatrixes() ([]map[string]interface{}, error) {
 		}
 	} else {
 		matrixes = append(matrixes, make(map[string]interface{}))
+		log.Debugf("Empty Strategy, matrixes=%v", matrixes)
 	}
 	return matrixes, nil
 }
@@ -451,14 +501,17 @@ func commonKeysMatch2(a map[string]interface{}, b map[string]interface{}, m map[
 type JobType int
 
 const (
-	// StepTypeRun is all steps that have a `run` attribute
+	// JobTypeDefault is all jobs that have a `run` attribute
 	JobTypeDefault JobType = iota
 
-	// StepTypeReusableWorkflowLocal is all steps that have a `uses` that is a local workflow in the .github/workflows directory
+	// JobTypeReusableWorkflowLocal is all jobs that have a `uses` that is a local workflow in the .github/workflows directory
 	JobTypeReusableWorkflowLocal
 
-	// JobTypeReusableWorkflowRemote is all steps that have a `uses` that references a workflow file in a github repo
+	// JobTypeReusableWorkflowRemote is all jobs that have a `uses` that references a workflow file in a github repo
 	JobTypeReusableWorkflowRemote
+
+	// JobTypeInvalid represents a job which is not configured correctly
+	JobTypeInvalid
 )
 
 func (j JobType) String() string {
@@ -474,13 +527,28 @@ func (j JobType) String() string {
 }
 
 // Type returns the type of the job
-func (j *Job) Type() JobType {
-	if strings.HasPrefix(j.Uses, "./.github/workflows") && (strings.HasSuffix(j.Uses, ".yml") || strings.HasSuffix(j.Uses, ".yaml")) {
-		return JobTypeReusableWorkflowLocal
-	} else if !strings.HasPrefix(j.Uses, "./") && strings.Contains(j.Uses, ".github/workflows") && (strings.Contains(j.Uses, ".yml@") || strings.Contains(j.Uses, ".yaml@")) {
-		return JobTypeReusableWorkflowRemote
+func (j *Job) Type() (JobType, error) {
+	isReusable := j.Uses != ""
+
+	if isReusable {
+		isYaml, _ := regexp.MatchString(`\.(ya?ml)(?:$|@)`, j.Uses)
+
+		if isYaml {
+			isLocalPath := strings.HasPrefix(j.Uses, "./")
+			isRemotePath, _ := regexp.MatchString(`^[^.](.+?/){2,}.+\.ya?ml@`, j.Uses)
+			hasVersion, _ := regexp.MatchString(`\.ya?ml@`, j.Uses)
+
+			if isLocalPath {
+				return JobTypeReusableWorkflowLocal, nil
+			} else if isRemotePath && hasVersion {
+				return JobTypeReusableWorkflowRemote, nil
+			}
+		}
+
+		return JobTypeInvalid, fmt.Errorf("`uses` key references invalid workflow path '%s'. Must start with './' if it's a local workflow, or must start with '<org>/<repo>/' and include an '@' if it's a remote workflow", j.Uses)
 	}
-	return JobTypeDefault
+
+	return JobTypeDefault, nil
 }
 
 // ContainerSpec is the specification of the container to use for the job
@@ -499,12 +567,14 @@ type ContainerSpec struct {
 
 // Step is the structure of one step in a job
 type Step struct {
-	ID                 string            `yaml:"id"`
-	If                 yaml.Node         `yaml:"if"`
-	Name               string            `yaml:"name"`
-	Uses               string            `yaml:"uses"`
-	Run                string            `yaml:"run"`
-	WorkingDirectory   string            `yaml:"working-directory"`
+	ID               string    `yaml:"id"`
+	If               yaml.Node `yaml:"if"`
+	Name             string    `yaml:"name"`
+	Uses             string    `yaml:"uses"`
+	Run              string    `yaml:"run"`
+	WorkingDirectory string    `yaml:"working-directory"`
+	// WorkflowShell is the shell really configured in the job, directly at step level or higher in defaults.run.shell
+	WorkflowShell      string            `yaml:"-"`
 	Shell              string            `yaml:"shell"`
 	Env                yaml.Node         `yaml:"env"`
 	With               map[string]string `yaml:"with"`
@@ -524,7 +594,7 @@ func (s *Step) String() string {
 	return s.ID
 }
 
-// Environments returns string-based key=value map for a step
+// Environment returns string-based key=value map for a step
 func (s *Step) Environment() map[string]string {
 	return environment(s.Env)
 }
@@ -547,8 +617,14 @@ func (s *Step) ShellCommand() string {
 
 	//Reference: https://github.com/actions/runner/blob/8109c962f09d9acc473d92c595ff43afceddb347/src/Runner.Worker/Handlers/ScriptHandlerHelpers.cs#L9-L17
 	switch s.Shell {
-	case "", "bash":
-		shellCommand = "bash --noprofile --norc -e -o pipefail {0}"
+	case "":
+		shellCommand = "bash -e {0}"
+	case "bash":
+		if s.WorkflowShell == "" {
+			shellCommand = "bash -e {0}"
+		} else {
+			shellCommand = "bash --noprofile --norc -e -o pipefail {0}"
+		}
 	case "pwsh":
 		shellCommand = "pwsh -command . '{0}'"
 	case "python":
@@ -556,7 +632,7 @@ func (s *Step) ShellCommand() string {
 	case "sh":
 		shellCommand = "sh -e {0}"
 	case "cmd":
-		shellCommand = "%ComSpec% /D /E:ON /V:OFF /S /C \"CALL \"{0}\"\""
+		shellCommand = "cmd /D /E:ON /V:OFF /S /C \"CALL \"{0}\"\""
 	case "powershell":
 		shellCommand = "powershell -command . '{0}'"
 	default:
